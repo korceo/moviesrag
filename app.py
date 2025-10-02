@@ -433,19 +433,39 @@ def _get(payload: dict, path: str, default=None):
             return default
     return cur
 
-# Safe image helper: поддерживает старый (use_container_width) и новый (width='stretch') API
 def _safe_image(src, caption: str | None = None):
+    # 1) Новые версии (строковый width)
     try:
-        # Новые версии (если поддерживают строковый width)
         st.image(src, caption=caption, width='stretch')
+        return
     except TypeError:
-        # Старые версии — только числовой width, используем совместимый флаг
-        st.image(src, caption=caption, use_container_width=True)
+        pass
     except Exception:
-        # На крайний случай просто покажем подпись
+        pass
+
+    # 2) Средние версии (use_container_width)
+    try:
+        st.image(src, caption=caption, use_container_width=True)
+        return
+    except TypeError:
+        pass
+    except Exception:
+        pass
+
+    # 3) Старые версии (use_column_width)
+    try:
+        st.image(src, caption=caption, use_column_width=True)
+        return
+    except Exception:
+        pass
+
+    # 4) Запасной вариант: без параметров
+    try:
+        st.image(src, caption=caption)
+        return
+    except Exception:
         if caption:
             st.markdown(f"**{caption}**")
-
 # ---------------
 # LLM summaries
 # ---------------
