@@ -433,6 +433,19 @@ def _get(payload: dict, path: str, default=None):
             return default
     return cur
 
+# Safe image helper: поддерживает старый (use_container_width) и новый (width='stretch') API
+def _safe_image(src, caption: str | None = None):
+    try:
+        # Новые версии (если поддерживают строковый width)
+        st.image(src, caption=caption, width='stretch')
+    except TypeError:
+        # Старые версии — только числовой width, используем совместимый флаг
+        st.image(src, caption=caption, use_container_width=True)
+    except Exception:
+        # На крайний случай просто покажем подпись
+        if caption:
+            st.markdown(f"**{caption}**")
+
 # ---------------
 # LLM summaries
 # ---------------
@@ -626,7 +639,7 @@ if query:
             poster = it.get("poster_url")
             caption = f"{title} ({year})" if year else title
             if poster:
-                st.image(poster, caption=caption, width='stretch')
+                _safe_image(poster, caption=caption)
             else:
                 st.markdown(f"**{caption}**")
             d = data_map.get(str(it.get("id")), {})
