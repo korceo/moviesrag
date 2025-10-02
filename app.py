@@ -58,6 +58,16 @@ if GROQ_API_KEY:
 @st.cache_resource(show_spinner=False)
 def get_client() -> QdrantClient:
     path = DB_PATH
+    # persistent override file (survives reruns)
+    ov_file = Path(os.getenv("QDRANT_OVERRIDE_FILE", "db/.qdrant_path_override"))
+    if ov_file.exists():
+        try:
+            ov_path = ov_file.read_text(encoding="utf-8").strip()
+            if ov_path:
+                path = ov_path
+                st.session_state["qdrant_path_override"] = ov_path
+        except Exception:
+            pass
     # если указали .../collection — подняться на 1 уровень к корню
     if os.path.basename(path.rstrip("/")) == "collection":
         path = os.path.dirname(path.rstrip("/"))
@@ -77,7 +87,14 @@ def get_client() -> QdrantClient:
             base = os.path.abspath(path)
             fresh = base + "_fresh"
             os.makedirs(fresh, exist_ok=True)
-            st.warning(f"Локальная БД Qdrant несовместима с текущим клиентом. Использую новый стор: {fresh}. Ниже можно переимпортировать коллекцию из data/*.")
+            try:
+                ov_file.write_text(fresh, encoding="utf-8")
+            except Exception:
+                pass
+            if not st.session_state.get("qdrant_warned"):
+                st.warning(f"Локальная БД Qdrant несовместима с текущим клиентом. Использую новый стор: {fresh}. Ниже можно переимпортировать коллекцию из data/*.")
+                st.session_state["qdrant_warned"] = True
+            st.session_state["qdrant_path_override"] = fresh
             return QdrantClient(path=fresh)
         st.error("Не удалось открыть локальный Qdrant: " + str(e))
         st.stop()
@@ -602,28 +619,29 @@ if query:
 
     # Fuzzy-фолбэк по названию (на случай опечаток)
     fuzzy = fuzzy_candidates(query, title_index, top_k=5)
-    if fuzzy and (not hits or fuzzy[0][0] >= 0.60):  # порог снижен для длинных названий
-        f_ids = [pid for _, pid, _ in fuzzy]
-        f_points = client.retrieve(collection_name=COLL_NAME, ids=f_ids, with_payload=True)
-        # Учитываем фильтр по годам, если он задан
-        if years:
-            y_min, y_max = float(min(years)), float(max(years))
-            filtered = []
-            for p in f_points:
-                pay = p.payload or {}
-                yv = _get(pay, "meta.year")
-                if yv is None:
-                    yv = pay.get("year")
-                try:
-                    yr = float(yv)
-                except Exception:
-                    continue
-                if (y_min - 1e-6) <= yr <= (y_max + 1e-6):
-                    filtered.append(p)
-            f_points = filtered
-        if f_points:
-            st.info("Найдено по лексическому совпадению в названиях (исправление опечаток).")
-            hits = f_points
+    if fuzzy:
+        f_ids = [pid for score, pid, _ in fuzzy if score >= 0.35]
+        if f_ids and (not hits or fuzzy[0][0] >= 0.35):  # порог снижен для длинных названий
+            f_points = client.retrieve(collection_name=COLL_NAME, ids=f_ids, with_payload=True)
+            # Учитываем фильтр по годам, если он задан
+            if years:
+                y_min, y_max = float(min(years)), float(max(years))
+                filtered = []
+                for p in f_points:
+                    pay = p.payload or {}
+                    yv = _get(pay, "meta.year")
+                    if yv is None:
+                        yv = pay.get("year")
+                    try:
+                        yr = float(yv)
+                    except Exception:
+                        continue
+                    if (y_min - 1e-6) <= yr <= (y_max + 1e-6):
+                        filtered.append(p)
+                f_points = filtered
+            if f_points:
+                st.info("Найдено по лексическому совпадению в названиях (исправление опечаток).")
+                hits = f_points
 
     # Сбор карточек
     items = []
