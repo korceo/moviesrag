@@ -156,47 +156,62 @@ def build_title_index(name: str):
             break
     return out
 
-def fuzzy_candidates(query: str, index: list, top_k: int = 5):
+# --- Simple transliteration (ru→lat) for cross‑alphabet fuzzy matching ---
+
+def _ru2lat(s: str) -> str:
+    m = {
+        'а':'a','б':'b','в':'v','г':'g','д':'d','е':'e','ё':'e','ж':'zh','з':'z','и':'i','й':'i','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p','р':'r','с':'s','т':'t','у':'u','ф':'f','х':'h','ц':'ts','ч':'ch','ш':'sh','щ':'sch','ъ':'','ы':'y','ь':'','э':'e','ю':'yu','я':'ya'
+    }
+    return "".join(m.get(ch, ch) for ch in s)
+
+# --- Improved fuzzy_candidates with transliteration and higher top_k ---
+def fuzzy_candidates(query: str, index: list, top_k: int = 10):
     """Возвращает top_k кандидатов по нечеткому совпадению.
-    Использует максимальный из трёх скорингов: полное сходство, partial ratio по окнам и token-set overlap.
+    Считает максимум из трёх скорингов на оригиналах (difflib full/partial, token-set),
+    и то же на транслитерированных строках (ru→lat), чтобы покрыть случаи типа «gari poter» ↔ «harry potter».
     """
     nq = _norm_text(query)
     if not nq:
         return []
+    nq_lat = _ru2lat(nq)
 
-    def _partial_ratio(nq: str, nt: str) -> float:
-        la, lb = len(nq), len(nt)
+    def _partial_ratio(a: str, b: str) -> float:
+        la, lb = len(a), len(b)
         if la == 0 or lb == 0:
             return 0.0
         if la >= lb:
-            return difflib.SequenceMatcher(None, nq, nt).ratio()
+            return difflib.SequenceMatcher(None, a, b).ratio()
         best = 0.0
-        # скользящее окно по символам
         for i in range(0, lb - la + 1):
-            sub = nt[i : i + la]
-            r = difflib.SequenceMatcher(None, nq, sub).ratio()
+            sub = b[i : i + la]
+            r = difflib.SequenceMatcher(None, a, sub).ratio()
             if r > best:
                 best = r
         return best
 
-    def _token_set_ratio(nq: str, nt: str) -> float:
-        a, b = set(nq.split()), set(nt.split())
-        if not a or not b:
+    def _token_set_ratio(a: str, b: str) -> float:
+        A, B = set(a.split()), set(b.split())
+        if not A or not B:
             return 0.0
-        inter = a & b
+        inter = A & B
         if not inter:
             return 0.0
-        # Дайс на токенах
-        return 2 * len(inter) / (len(a) + len(b))
+        return 2 * len(inter) / (len(A) + len(B))
 
     scored = []
     for pid, nt, ot in index:
         if not nt:
             continue
+        nt_lat = _ru2lat(nt)
+        # Оригинальные строки
         full = difflib.SequenceMatcher(None, nq, nt).ratio()
         part = _partial_ratio(nq, nt)
         tset = _token_set_ratio(nq, nt)
-        score = max(full, part, tset)
+        # Транслитерированные строки (ru→lat)
+        full_l = difflib.SequenceMatcher(None, nq_lat, nt_lat).ratio()
+        part_l = _partial_ratio(nq_lat, nt_lat)
+        tset_l = _token_set_ratio(nq_lat, nt_lat)
+        score = max(full, part, tset, full_l, part_l, tset_l)
         scored.append((score, pid, ot))
 
     scored.sort(key=lambda x: x[0], reverse=True)
@@ -534,6 +549,29 @@ def llm_pitches(items: list[dict]) -> dict[str, dict]:
 # ---------------------
 # UI
 # ---------------------
+# One-time init on app start: ensure collection and auto-import if empty
+try:
+    _client_boot = get_client()
+    ensure_collection(_client_boot, COLL_NAME)
+    _cnt = None
+    try:
+        _cnt = _client_boot.count(COLL_NAME, exact=True).count
+    except Exception:
+        _cnt = None
+    if (_cnt == 0) and AUTO_IMPORT:
+        import_points(_client_boot, COLL_NAME)
+        try:
+            _cnt = _client_boot.count(COLL_NAME, exact=True).count
+        except Exception:
+            _cnt = None
+    # mark initialized
+    try:
+        APP_INIT_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        APP_INIT_MARKER.write_text(datetime.now().isoformat(), encoding='utf-8')
+    except Exception:
+        pass
+except Exception:
+    pass
 st.markdown("### Введите запрос: ")
 query = st.text_input("Запрос", placeholder="например: корейские триллеры 2025 без супергероев", label_visibility="collapsed")
 
@@ -694,27 +732,3 @@ if query:
 
 if query and not hits:
     st.info("Ничего не найдено по запросу. Попробуй переформулировать или ослабить условия.")
-# One-time init on app start: ensure collection and auto-import if empty
-try:
-    _client_boot = get_client()
-    ensure_collection(_client_boot, COLL_NAME)
-    _cnt = None
-    try:
-        _cnt = _client_boot.count(COLL_NAME, exact=True).count
-    except Exception:
-        _cnt = None
-    if (_cnt == 0) and AUTO_IMPORT:
-        import_points(_client_boot, COLL_NAME)
-        try:
-            _cnt = _client_boot.count(COLL_NAME, exact=True).count
-        except Exception:
-            _cnt = None
-    # mark initialized
-    try:
-        APP_INIT_MARKER.parent.mkdir(parents=True, exist_ok=True)
-        APP_INIT_MARKER.write_text(datetime.now().isoformat(), encoding='utf-8')
-    except Exception:
-        pass
-except Exception:
-    pass
-st.markdown("### Введите запрос: ")
