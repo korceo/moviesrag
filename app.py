@@ -8,7 +8,7 @@ import re, unicodedata, difflib
 
 from qdrant_client import QdrantClient
 from qdrant_client.http.models import (
-    SearchParams, Filter, FieldCondition, MatchAny, MatchValue, Range, PointStruct
+    SearchParams, Filter, FieldCondition, MatchAny, MatchValue, Range, PointStruct, VectorParams, Distance
 )
 
 # ---------------------
@@ -257,18 +257,20 @@ def import_points(client: QdrantClient, name: str,
 
 # --- Helpers ---
 
-def assert_collection_exists(client: QdrantClient, name: str):
+def ensure_collection(client: QdrantClient, name: str):
+    """Гарантирует существование коллекции. Если нет — создаёт с нужной размерностью."""
     try:
         cols = client.get_collections().collections
         names = [getattr(c, "name", None) for c in cols]
     except Exception:
         names = []
-    if name not in names:
-        st.error(
-            f"Коллекция '{name}' не найдена в '{DB_PATH}'. "
-            f"Ожидается: '{os.path.join(DB_PATH, 'collection', name, 'storage.sqlite')}'. Найдены: {names or '∅'}"
-        )
-        st.stop()
+    if name in names:
+        return
+    dim = get_vector_size()
+    client.create_collection(
+        collection_name=name,
+        vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
+    )
 
 def embed_query(text: str) -> np.ndarray:
     vec = get_embedder().encode([f"query: {text}"], normalize_embeddings=True)
@@ -462,7 +464,7 @@ hits = []
 if query:
     client = get_client()
     # Проверяем наличие коллекции, не создаём
-    assert_collection_exists(client, COLL_NAME)
+    ensure_collection(client, COLL_NAME)
 
     # Готовим индекс заголовков для лексического фолбэка (кешируется)
     title_index = build_title_index(COLL_NAME)

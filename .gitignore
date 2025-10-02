@@ -214,3 +214,5 @@ __marimo__/
 .env
 .venv/
 __pycache__/
+
+db/**/.lock
