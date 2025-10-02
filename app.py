@@ -60,13 +60,25 @@ def get_client() -> QdrantClient:
     # если указали .../collection — подняться на 1 уровень к корню
     if os.path.basename(path.rstrip("/")) == "collection":
         path = os.path.dirname(path.rstrip("/"))
-    # если случайно передали путь к файлу storage.sqlite — подняться на 2 уровня
+    # если случайно передали путь к storage.sqlite — подняться на 2 уровня
     if os.path.isfile(os.path.join(path, "storage.sqlite")):
         path = os.path.dirname(os.path.dirname(path))
     try:
         return QdrantClient(path=path)
     except RuntimeError as e:
+        # лок ожидает другой процесс
         st.error("Qdrant локальный стор уже открыт другим процессом. Закрой другой запуск или перезапусти Python. Детали: " + str(e))
+        st.stop()
+    except Exception as e:
+        emsg = repr(e)
+        # несовместимый формат хранилища → создаём новый путь и работаем с ним
+        if ("ValidationError" in emsg) or ("CreateCollection" in emsg):
+            base = os.path.abspath(path)
+            fresh = base + "_fresh"
+            os.makedirs(fresh, exist_ok=True)
+            st.warning(f"Локальная БД Qdrant несовместима с текущим клиентом. Использую новый стор: {fresh}. Ниже можно переимпортировать коллекцию из data/*.")
+            return QdrantClient(path=fresh)
+        st.error("Не удалось открыть локальный Qdrant: " + str(e))
         st.stop()
 
 @st.cache_resource(show_spinner=False)
