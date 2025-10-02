@@ -184,20 +184,40 @@ def _fail(msg: str):
     st.stop()
 
 @st.cache_resource(show_spinner=False)
-def _load_ids(path: Path) -> list:
+def _load_ids(path: Path) -> list[int]:
     if not path.exists():
         _fail(f"Не найден файл id_map: {path}")
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
+
+    ids: list = []
     if isinstance(data, list):
-        return list(data)
-    if isinstance(data, dict):
-        try:
-            items = sorted(((int(k), v) for k, v in data.items()), key=lambda x: x[0])
-            return [v for _, v in items]
-        except Exception:
-            return list(data.values())
-    _fail("Неподдержимый формат id_map.json — ожидается list или dict")
+        ids = data
+    elif isinstance(data, dict):
+        # частый вариант: {"ids": [...]} -> берём список
+        if "ids" in data and isinstance(data["ids"], list):
+            ids = data["ids"]
+        else:
+            # попытка: словарь с числовыми ключами
+            try:
+                items = sorted(((int(k), v) for k, v in data.items()), key=lambda x: x[0])
+                ids = [v for _, v in items]
+            except Exception:
+                # если единственное поле содержит список — используем его
+                if len(data) == 1:
+                    only_val = next(iter(data.values()))
+                    if isinstance(only_val, list):
+                        ids = only_val
+                if not ids:
+                    _fail("Неподдержимый формат id_map.json — ожидается list, dict с ключом 'ids' или dict с числовыми ключами")
+    else:
+        _fail("Неподдержимый формат id_map.json — ожидается list или dict")
+
+    # приведение к int
+    try:
+        return [int(x) for x in ids]
+    except Exception:
+        _fail("id_map.json: не удалось привести значения ids к int")
 
 @st.cache_resource(show_spinner=False)
 def _load_embeddings(path: Path) -> np.ndarray:
@@ -236,25 +256,42 @@ def import_points(client: QdrantClient, name: str,
     vecs = _load_embeddings(emb_path)
     payloads = _load_payloads(payl_path)
 
-    n_ids, n_vecs, n_payl = len(ids), vecs.shape[0], len(payloads)
-    if not (n_ids == n_vecs == n_payl):
-        _fail(f"Несовпадение размеров: ids={n_ids}, emb={n_vecs}, payloads={n_payl}")
+    n_ids, n_vecs = len(ids), vecs.shape[0]
+    if n_ids != n_vecs:
+        _fail(f"Несовпадение размеров: ids={n_ids}, emb={n_vecs}")
 
-    vecs = _maybe_l2_normalize(vecs)  # COSINE
+    # Приводим к float32 и L2-нормализуем для COSINE
+    if vecs.dtype != np.float32:
+        vecs = vecs.astype(np.float32)
+    vecs = _maybe_l2_normalize(vecs)
 
-    batch = 2048
-    total = n_vecs
-    progress = st.progress(0.0, text="Импорт векторов в Qdrant...")
-    for start in range(0, total, batch):
-        end = min(start + batch, total)
-        points = [
-            PointStruct(id=ids[i], vector=vecs[i].tolist(), payload=payloads[i])
-            for i in range(start, end)
-        ]
-        client.upsert(collection_name=name, points=points, wait=True)
-        progress.progress(end / total, text=f"Импортировано {end}/{total}")
-    progress.empty()
-    st.success(f"Импорт завершён: {total} точек.")
+    # Строим маппинг payload по tmdb_id / meta.tmdb_id
+    payload_by_id: dict[int, dict] = {}
+    for rec in payloads:
+        tmdb_id = rec.get("tmdb_id")
+        if tmdb_id is None:
+            tmdb_id = _get(rec, "meta.tmdb_id")
+        if tmdb_id is None:
+            continue
+        try:
+            payload_by_id[int(tmdb_id)] = rec
+        except Exception:
+            continue
+
+    # Выравниваем payload по порядку ids
+    aligned_payload = [payload_by_id.get(i, {"meta": {"tmdb_id": i}}) for i in ids]
+
+    st.info(f"Импорт {n_vecs} точек в коллекцию '{name}'…")
+    client.upload_collection(
+        collection_name=name,
+        vectors=vecs,
+        payload=aligned_payload,
+        ids=ids,
+        batch_size=1000,
+        parallel=2,
+        wait=True,
+    )
+    st.success(f"Импорт завершён: {n_vecs} точек.")
 
 # --- Helpers ---
 
