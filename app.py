@@ -42,30 +42,6 @@ QDRANT_RESET_ALWAYS = os.getenv("QDRANT_RESET_ALWAYS", "0") == "1"
 
 st.set_page_config(page_title="MoviesRAG", layout="wide")
 
-# One-time init on app start: ensure collection and auto-import if empty
-try:
-    _client_boot = get_client()
-    ensure_collection(_client_boot, COLL_NAME)
-    _cnt = None
-    try:
-        _cnt = _client_boot.count(COLL_NAME, exact=True).count
-    except Exception:
-        _cnt = None
-    if (_cnt == 0) and AUTO_IMPORT:
-        import_points(_client_boot, COLL_NAME)
-        try:
-            _cnt = _client_boot.count(COLL_NAME, exact=True).count
-        except Exception:
-            _cnt = None
-    # mark initialized
-    try:
-        APP_INIT_MARKER.parent.mkdir(parents=True, exist_ok=True)
-        APP_INIT_MARKER.write_text(datetime.now().isoformat(), encoding='utf-8')
-    except Exception:
-        pass
-except Exception:
-    pass
-
 # Lazy imports for LLM only if key present
 _llm = None
 if GROQ_API_KEY:
@@ -636,9 +612,9 @@ if query:
             st.caption(f"Фильтр по году временно расширен до {int(y_min)-1}–{int(y_max)+1} для добора кандидатов")
 
     # Fuzzy-фолбэк по названию (на случай опечаток)
-    fuzzy = fuzzy_candidates(query, title_index, top_k=5)
+    fuzzy = fuzzy_candidates(query, title_index, top_k=8)
     if fuzzy:
-        # берем достаточно похожие или хотя бы топ-1
+        # берём достаточно похожие id или хотя бы топ-1
         f_ids = [pid for score, pid, _ in fuzzy if score >= 0.35] or [fuzzy[0][1]]
         f_points = client.retrieve(collection_name=COLL_NAME, ids=f_ids, with_payload=True)
         # Учитываем фильтр по годам, если он задан
@@ -659,10 +635,14 @@ if query:
             f_points = filtered
         if f_points:
             st.info("Найдено по лексическому совпадению в названиях (исправление опечаток).")
-            existing = {p.id for p in hits}
-            for p in f_points:
-                if p.id not in existing and len(hits) < 5:
-                    hits.append(p)
+            # Фаззи-кандидаты — приоритет, затем дозаполняем векторными до 5
+            uniq = {}
+            for p in list(f_points) + list(hits):
+                if p.id not in uniq:
+                    uniq[p.id] = p
+                if len(uniq) >= 5:
+                    break
+            hits = list(uniq.values())
 
     # Сбор карточек
     items = []
@@ -714,3 +694,27 @@ if query:
 
 if query and not hits:
     st.info("Ничего не найдено по запросу. Попробуй переформулировать или ослабить условия.")
+# One-time init on app start: ensure collection and auto-import if empty
+try:
+    _client_boot = get_client()
+    ensure_collection(_client_boot, COLL_NAME)
+    _cnt = None
+    try:
+        _cnt = _client_boot.count(COLL_NAME, exact=True).count
+    except Exception:
+        _cnt = None
+    if (_cnt == 0) and AUTO_IMPORT:
+        import_points(_client_boot, COLL_NAME)
+        try:
+            _cnt = _client_boot.count(COLL_NAME, exact=True).count
+        except Exception:
+            _cnt = None
+    # mark initialized
+    try:
+        APP_INIT_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        APP_INIT_MARKER.write_text(datetime.now().isoformat(), encoding='utf-8')
+    except Exception:
+        pass
+except Exception:
+    pass
+st.markdown("### Введите запрос: ")
