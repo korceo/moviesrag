@@ -1,9 +1,10 @@
-import os, json, numpy as np
+import os, json, numpy as np, shutil
 import streamlit as st
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 import torch
 from pathlib import Path
+from datetime import datetime
 import re, unicodedata, difflib
 
 from qdrant_client import QdrantClient
@@ -27,13 +28,43 @@ IDS_PATH  = Path("data/id_map.json")
 EMB_PATH  = Path("data/embeddings.npy")
 PAYL_PATH = Path("data/payload.jsonl")
 
+#
 # Корень локального стора Qdrant (внутри должен лежать каталог `collection/`)
 DB_PATH = os.getenv("QDRANT_PATH", "db/qdrant_db")
 
 # Настройка обрезки для fallback-описаний (0 = не обрезать)
 FALLBACK_OVERVIEW_CHARS = 0  # 0 = не обрезать fallback-описания вовсе
 
+# Init flags
+APP_INIT_MARKER = Path(os.getenv("APP_INIT_MARKER", "db/.initialized"))
+AUTO_IMPORT = os.getenv("AUTO_IMPORT_ON_EMPTY", "1") != "0"
+QDRANT_RESET_ALWAYS = os.getenv("QDRANT_RESET_ALWAYS", "0") == "1"
+
 st.set_page_config(page_title="MoviesRAG", layout="wide")
+
+# One-time init on app start: ensure collection and auto-import if empty
+try:
+    _client_boot = get_client()
+    ensure_collection(_client_boot, COLL_NAME)
+    _cnt = None
+    try:
+        _cnt = _client_boot.count(COLL_NAME, exact=True).count
+    except Exception:
+        _cnt = None
+    if (_cnt == 0) and AUTO_IMPORT:
+        import_points(_client_boot, COLL_NAME)
+        try:
+            _cnt = _client_boot.count(COLL_NAME, exact=True).count
+        except Exception:
+            _cnt = None
+    # mark initialized
+    try:
+        APP_INIT_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        APP_INIT_MARKER.write_text(datetime.now().isoformat(), encoding='utf-8')
+    except Exception:
+        pass
+except Exception:
+    pass
 
 # Lazy imports for LLM only if key present
 _llm = None
@@ -55,49 +86,49 @@ if GROQ_API_KEY:
     ])
     _llm = ChatGroq(model="openai/gpt-oss-120b", temperature=0.6, max_tokens=1600)
 
+
+# Reset local Qdrant storage (move to backup and create clean folder)
+def _reset_qdrant_storage(path: str) -> str:
+    base = os.path.abspath(path)
+    try:
+        if os.path.isdir(base) and os.listdir(base):
+            backup = f"{base}.bak-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            shutil.move(base, backup)
+    except Exception:
+        pass
+    os.makedirs(base, exist_ok=True)
+    return base
+
 @st.cache_resource(show_spinner=False)
 def get_client() -> QdrantClient:
     path = DB_PATH
-    # persistent override file (survives reruns)
-    ov_file = Path(os.getenv("QDRANT_OVERRIDE_FILE", "db/.qdrant_path_override"))
-    if ov_file.exists():
-        try:
-            ov_path = ov_file.read_text(encoding="utf-8").strip()
-            if ov_path:
-                path = ov_path
-                st.session_state["qdrant_path_override"] = ov_path
-        except Exception:
-            pass
-    # если указали .../collection — подняться на 1 уровень к корню
+    # First run or forced reset → clean storage at original path
+    if QDRANT_RESET_ALWAYS or not APP_INIT_MARKER.exists():
+        path = _reset_qdrant_storage(path)
+    # normalize path if a nested path was passed
     if os.path.basename(path.rstrip("/")) == "collection":
         path = os.path.dirname(path.rstrip("/"))
-    # если случайно передали путь к storage.sqlite — подняться на 2 уровня
     if os.path.isfile(os.path.join(path, "storage.sqlite")):
         path = os.path.dirname(os.path.dirname(path))
     try:
         return QdrantClient(path=path)
     except RuntimeError as e:
-        # лок ожидает другой процесс
-        st.error("Qdrant локальный стор уже открыт другим процессом. Закрой другой запуск или перезапусти Python. Детали: " + str(e))
+        msg = str(e)
+        # if storage is already accessed by another instance → fallback to a temp run-specific dir
+        if "already accessed" in msg:
+            tmp = f"{os.path.abspath(path)}_run_{os.getpid()}_{int(datetime.now().timestamp())}"
+            os.makedirs(tmp, exist_ok=True)
+            return QdrantClient(path=tmp)
+        st.error("Qdrant локальный стор уже открыт другим процессом. Детали: " + msg)
         st.stop()
     except Exception as e:
-        emsg = repr(e)
-        # несовместимый формат хранилища → создаём новый путь и работаем с ним
-        if ("ValidationError" in emsg) or ("CreateCollection" in emsg):
-            base = os.path.abspath(path)
-            fresh = base + "_fresh"
-            os.makedirs(fresh, exist_ok=True)
-            try:
-                ov_file.write_text(fresh, encoding="utf-8")
-            except Exception:
-                pass
-            if not st.session_state.get("qdrant_warned"):
-                st.warning(f"Локальная БД Qdrant несовместима с текущим клиентом. Использую новый стор: {fresh}. Ниже можно переимпортировать коллекцию из data/*.")
-                st.session_state["qdrant_warned"] = True
-            st.session_state["qdrant_path_override"] = fresh
-            return QdrantClient(path=fresh)
-        st.error("Не удалось открыть локальный Qdrant: " + str(e))
-        st.stop()
+        # incompatible storage → hard reset and retry once
+        path = _reset_qdrant_storage(DB_PATH)
+        try:
+            return QdrantClient(path=path)
+        except Exception as e2:
+            st.error("Не удалось открыть локальный Qdrant: " + str(e2))
+            st.stop()
 
 @st.cache_resource(show_spinner=False)
 def get_embedder() -> SentenceTransformer:
@@ -115,8 +146,9 @@ def _norm_text(s: str) -> str:
         return ""
     s = str(s).lower().replace("ё", "е")
     s = unicodedata.normalize("NFKD", s)
-    # оставить буквы/цифры (включая кириллицу), заменить прочее пробелом
     s = re.sub(r"[^\w]+", " ", s, flags=re.UNICODE)
+    # collapse repeated letters: гаррри → гари, потттер → потер
+    s = re.sub(r"([a-zа-я])\1+", r"\1", s)
     return " ".join(s.split())
 
 @st.cache_resource(show_spinner=False)
@@ -451,7 +483,6 @@ def _get(payload: dict, path: str, default=None):
     return cur
 
 def _safe_image(src, caption: str | None = None):
-    # 1) Новые версии (строковый width)
     try:
         st.image(src, caption=caption, width='stretch')
         return
@@ -459,24 +490,11 @@ def _safe_image(src, caption: str | None = None):
         pass
     except Exception:
         pass
-
-    # 2) Средние версии (use_container_width)
-    try:
-        st.image(src, caption=caption, use_container_width=True)
-        return
-    except TypeError:
-        pass
-    except Exception:
-        pass
-
-    # 3) Старые версии (use_column_width)
     try:
         st.image(src, caption=caption, use_column_width=True)
         return
     except Exception:
         pass
-
-    # 4) Запасной вариант: без параметров
     try:
         st.image(src, caption=caption)
         return
@@ -620,28 +638,31 @@ if query:
     # Fuzzy-фолбэк по названию (на случай опечаток)
     fuzzy = fuzzy_candidates(query, title_index, top_k=5)
     if fuzzy:
-        f_ids = [pid for score, pid, _ in fuzzy if score >= 0.35]
-        if f_ids and (not hits or fuzzy[0][0] >= 0.35):  # порог снижен для длинных названий
-            f_points = client.retrieve(collection_name=COLL_NAME, ids=f_ids, with_payload=True)
-            # Учитываем фильтр по годам, если он задан
-            if years:
-                y_min, y_max = float(min(years)), float(max(years))
-                filtered = []
-                for p in f_points:
-                    pay = p.payload or {}
-                    yv = _get(pay, "meta.year")
-                    if yv is None:
-                        yv = pay.get("year")
-                    try:
-                        yr = float(yv)
-                    except Exception:
-                        continue
-                    if (y_min - 1e-6) <= yr <= (y_max + 1e-6):
-                        filtered.append(p)
-                f_points = filtered
-            if f_points:
-                st.info("Найдено по лексическому совпадению в названиях (исправление опечаток).")
-                hits = f_points
+        # берем достаточно похожие или хотя бы топ-1
+        f_ids = [pid for score, pid, _ in fuzzy if score >= 0.35] or [fuzzy[0][1]]
+        f_points = client.retrieve(collection_name=COLL_NAME, ids=f_ids, with_payload=True)
+        # Учитываем фильтр по годам, если он задан
+        if years:
+            y_min, y_max = float(min(years)), float(max(years))
+            filtered = []
+            for p in f_points:
+                pay = p.payload or {}
+                yv = _get(pay, "meta.year")
+                if yv is None:
+                    yv = pay.get("year")
+                try:
+                    yr = float(yv)
+                except Exception:
+                    continue
+                if (y_min - 1e-6) <= yr <= (y_max + 1e-6):
+                    filtered.append(p)
+            f_points = filtered
+        if f_points:
+            st.info("Найдено по лексическому совпадению в названиях (исправление опечаток).")
+            existing = {p.id for p in hits}
+            for p in f_points:
+                if p.id not in existing and len(hits) < 5:
+                    hits.append(p)
 
     # Сбор карточек
     items = []
